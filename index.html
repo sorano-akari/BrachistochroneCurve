@@ -178,9 +178,11 @@ function update(){
     coin.y += coin.vy * FIXED_DT;
     tryBindToLineIfContact(coin);
   } else {
-    // 吸着している線がなくなった場合、投擲運動に切り替え
+    // 【変更点】吸着している線がなくなった場合、投擲運動に切り替え
     if (onLineLineIndex === -1 || smoothedLines[onLineLineIndex] === undefined || smoothedLines[onLineLineIndex].length < 2) {
       coinOnLine = false;
+      onLineLineIndex = -1;
+      onLineIndex = -1;
       return;
     }
 
@@ -191,6 +193,8 @@ function update(){
     // p2が存在しない（線分の終端）場合も投擲運動に切り替え
     if (!p2) {
         coinOnLine = false;
+        onLineLineIndex = -1;
+        onLineIndex = -1;
         return;
     }
     
@@ -433,12 +437,13 @@ function eraseLine(pos){
   }
   
   if (lineToRemove !== -1) {
+    const wasOnThisLine = (onLineLineIndex === lineToRemove);
     smoothedLines.splice(lineToRemove, 1); // 該当する線を削除
-    // もし削除した線にコインが乗っていたら、coinOnLineをfalseにする
-    if (onLineLineIndex === lineToRemove) {
-      coinOnLine = false;
-      onLineLineIndex = -1;
-      onLineIndex = -1;
+    
+    if (wasOnThisLine) {
+        coinOnLine = false;
+        onLineLineIndex = -1;
+        onLineIndex = -1;
     }
     // 削除によってインデックスがずれる可能性があるので調整
     if (onLineLineIndex > lineToRemove) {
@@ -601,6 +606,12 @@ resetButton.addEventListener('click',()=>{
 clearButton.addEventListener('click',()=>{
   smoothedLines=[]; 
   drawingPoints=[];
+  // 【変更点】線を全て消す際にコインの状態もリセット
+  coinOnLine = false;
+  onLineLineIndex = -1;
+  onLineIndex = -1;
+  s_on_segment = 0;
+  onLineDirection = 1;
 });
 
 toolButtons.forEach(button => {

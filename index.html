@@ -1,0 +1,646 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>最速コインチャレンジ</title>
+<style>
+  body{
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    justify-content:flex-start;
+    min-height:100vh;
+    margin:0;
+    font-family: "Hiragino Kaku Gothic Pro","メイリオ",sans-serif;
+    background:#f3f6fb;
+    color:#222;
+    padding:18px;
+  }
+  h1{margin:8px 0 4px;}
+  p{margin:0 0 12px;color:#444;}
+  canvas{border:2px solid #333;background:#fff; touch-action:none;}
+  .controls{margin-top:10px;display:flex;gap:8px;}
+  button{padding:8px 14px;border-radius:6px;border:1px solid #bbb;background:#e9eef8;cursor:pointer;}
+  button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .tools button.active-tool{
+    background:#3498db;
+    color:#fff;
+    border-color:#3498db;
+  }
+</style>
+</head>
+<body>
+  <h1>最速コインチャレンジ（複数線対応版）</h1>
+  <p>線を引いてコインをゴールまで導こう！ダブルクリックで描画モードを終了できるよ。</p>
+  <canvas id="gameCanvas" width="900" height="540"></canvas>
+  <div class="controls">
+    <button id="startStopButton">スタート</button>
+    <button id="resetButton">リセット</button>
+    <button id="clearButton">線を全部消す</button>
+  </div>
+  <div class="tools" style="margin-top:10px; display:flex; gap:8px;">
+    <button id="toolPen" data-tool="pen" class="active-tool">手書き</button>
+    <button id="toolEraser" data-tool="eraser">消しゴム</button>
+    <button id="toolCycloid">最速曲線</button>
+  </div>
+
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const startStopButton = document.getElementById('startStopButton');
+const resetButton = document.getElementById('resetButton');
+const clearButton = document.getElementById('clearButton');
+const controls = document.querySelectorAll('.controls button');
+
+const toolButtons = document.querySelectorAll('.tools button');
+const cycloidButton = document.getElementById('toolCycloid');
+
+const GRAVITY = 980;
+const FIXED_DT = 1/120;
+const SPIN_FACTOR = 0.05;
+
+function sub(a,b){return {x:a.x-b.x, y:a.y-b.y};}
+function add(a,b){return {x:a.x+b.x, y:a.y+b.y};}
+function scale(a,s){return {x:a.x*s, y:a.y*s};}
+function dot(a,b){return a.x*b.x + a.y*b.y;}
+function len(a){return Math.hypot(a.x,a.y);}
+function normalize(a){ const L=len(a)||1; return {x:a.x/L, y:a.y/L};}
+
+let coin = null;
+let gameStarted = false;
+let coinOnLine = false;
+let onLineLineIndex = -1; // 何番目の線に吸着しているか
+let onLineIndex = -1;     // その線の何番目のセグメントに吸着しているか
+let s_on_segment = 0;
+let onLineDirection = 1;
+let startTime = 0;
+let elapsedTime = 0;
+let bestTime = Infinity;
+let lastUpdate = performance.now();
+
+let drawingPoints = [];
+let smoothedLines = []; // smoothedLines は [[{x,y},{x,y},...], [{x,y},{x,y},...]] のような構造になる
+let activeTool = 'pen';
+let isDrawing = false;
+let currentMousePos = null;
+
+const START_X = 50;
+const START_Y = 50;
+const END_X = canvas.width - 50;
+const END_Y = 50;
+const COIN_RADIUS = 15;
+const GOAL_RADIUS = 18;
+
+const START_OFFSET_X = -10;
+const END_OFFSET_X = 10;
+const startPoint = {x: START_X, y: START_Y};
+const endPoint = {x: END_X, y: END_Y};
+
+function createCoin(x,y){
+  return { x:x, y:y, vx:0, vy:0, radius:COIN_RADIUS, spinAngle:0 };
+}
+
+function smoothLine(points){
+  if(points.length<3) return points.slice();
+  const out=[points[0]];
+  for(let i=1;i<points.length-1;i++){
+    const avgX=(points[i-1].x+points[i].x+points[i+1].x)/3;
+    const avgY=(points[i-1].y+points[i].y+points[i+1].y)/3;
+    out.push({x:avgX,y:avgY});
+  }
+  out.push(points[points.length-1]);
+  return out;
+}
+
+function segmentUnit(p1,p2){
+  const d=sub(p2,p1);
+  const L=len(d)||1;
+  return { u:{x:d.x/L, y:d.y/L}, L };
+}
+
+function closestPointOnSegment(p,p1,p2){
+  const d=sub(p2,p1);
+  const denom=d.x*d.x+d.y*d.y;
+  if(denom===0) return {pt:{x:p1.x,y:p1.y}, t:0};
+  const t=((p.x-p1.x)*d.x+(p.y-p1.y)*d.y)/denom;
+  const tt=Math.max(0,Math.min(1,t));
+  return { pt:{x:p1.x+d.x*tt, y:p1.y+d.y*tt}, t:tt };
+}
+
+function tryBindToLineIfContact(coin){
+  // 各線に対して吸着判定を行う
+  for(let lineIdx = 0; lineIdx < smoothedLines.length; lineIdx++){
+    const currentLine = smoothedLines[lineIdx];
+    if (currentLine.length < 2) continue; // 線分が短すぎる場合はスキップ
+
+    for(let segIdx = 0; segIdx < currentLine.length - 1; segIdx++){
+      const p1 = currentLine[segIdx], p2 = currentLine[segIdx+1];
+      const cp = closestPointOnSegment({x:coin.x, y:coin.y}, p1, p2);
+      const closest = cp.pt;
+      const dist = len(sub(closest, {x:coin.x, y:coin.y}));
+      
+      if(dist <= coin.radius){
+        const v = {x:coin.vx, y:coin.vy};
+        const u = normalize(sub(p2, p1));
+        const normal = {x: u.y, y: -u.x}; // 線分に垂直な法線ベクトル（右側を向く）
+        
+        const v_normal = dot(v, normal);
+        
+        // コインが線の「上側」から衝突した場合
+        if(v_normal < 0){
+          coin.x = closest.x;
+          coin.y = closest.y;
+          coinOnLine = true;
+          onLineLineIndex = lineIdx;
+          onLineIndex = segIdx;
+          s_on_segment = len(sub(closest, p1));
+          const tangentialSpeed = dot(v, u);
+          onLineDirection = Math.sign(tangentialSpeed) || 1;
+          return true;
+        } 
+        // コインが線の「下側」から衝突した場合（反射）
+        else if (v_normal > 0) {
+          // めり込み量を考慮して位置を修正
+          const overlap = coin.radius - dist;
+          const correction = scale(normal, overlap);
+          coin.x += correction.x;
+          coin.y += correction.y;
+
+          // 反射計算
+          const v_tangent_scalar = dot(v, u);
+          const v_normal_scalar = dot(v, normal);
+
+          const v_tangent = scale(u, v_tangent_scalar);
+          const v_normal_reflected = scale(normal, -v_normal_scalar);
+
+          coin.vx = v_tangent.x + v_normal_reflected.x;
+          coin.vy = v_tangent.y + v_normal_reflected.y;
+
+          return false; // 跳ね返ったので吸着はしない
+        }
+      }
+    }
+  }
+  return false;
+}
+
+function update(){
+  if(!gameStarted) return;
+  
+  if(!coinOnLine){
+    coin.vy += GRAVITY * FIXED_DT;
+    coin.x += coin.vx * FIXED_DT;
+    coin.y += coin.vy * FIXED_DT;
+    tryBindToLineIfContact(coin);
+  } else {
+    // 吸着している線がなくなった場合、投擲運動に切り替え
+    if (onLineLineIndex === -1 || smoothedLines[onLineLineIndex] === undefined || smoothedLines[onLineLineIndex].length < 2) {
+      coinOnLine = false;
+      return;
+    }
+
+    const currentLine = smoothedLines[onLineLineIndex];
+    const p1 = currentLine[onLineIndex];
+    const p2 = currentLine[onLineIndex + 1];
+    
+    // p2が存在しない（線分の終端）場合も投擲運動に切り替え
+    if (!p2) {
+        coinOnLine = false;
+        return;
+    }
+    
+    const { u: current_u, L } = segmentUnit(p1, p2);
+
+    const deltaY = coin.y - startPoint.y;
+    const currentSpeedSq = 2 * GRAVITY * deltaY;
+    
+    let v_tangent;
+    
+    // 速度がゼロ以下になった場合、重力による加速を適用
+    if (currentSpeedSq <= 0) {
+        const g_tangential = dot({x: 0, y: GRAVITY}, current_u);
+        v_tangent = g_tangential * FIXED_DT;
+        onLineDirection = Math.sign(g_tangential) || 1;
+    } else {
+        const currentSpeed = Math.sqrt(currentSpeedSq);
+        v_tangent = currentSpeed * onLineDirection;
+    }
+
+    s_on_segment += v_tangent * FIXED_DT;
+    
+    if(s_on_segment > L){ // 現在のセグメントの終端を超えた
+      if(onLineIndex < currentLine.length - 2){ // 同じ線の次のセグメントがある場合
+        const remainingDistance = s_on_segment - L;
+        onLineIndex++;
+        s_on_segment = remainingDistance;
+        
+        const nextP1 = currentLine[onLineIndex];
+        const nextP2 = currentLine[onLineIndex+1];
+        const { u: next_u } = segmentUnit(nextP1, nextP2);
+        
+        const newPos = add(nextP1, scale(next_u, s_on_segment));
+        coin.x = newPos.x;
+        coin.y = newPos.y;
+        
+        const nextSpeed = Math.abs(v_tangent);
+        coin.vx = next_u.x * nextSpeed * onLineDirection;
+        coin.vy = next_u.y * nextSpeed * onLineDirection;
+      } else { // 現在の線分の終端に達した場合
+        coinOnLine = false; // 投擲運動に切り替え
+        
+        // 線の終端での速度を設定して自然に切り替え
+        const finalSpeed = Math.abs(v_tangent);
+        coin.vx = current_u.x * finalSpeed * onLineDirection;
+        coin.vy = current_u.y * finalSpeed * onLineDirection;
+      }
+    } else if (s_on_segment < 0){ // 現在のセグメントの始端を超えて逆走した場合
+      if (onLineIndex > 0) { // 同じ線の前のセグメントがある場合
+        onLineIndex--;
+        const prevP1 = currentLine[onLineIndex];
+        const prevP2 = currentLine[onLineIndex+1];
+        const { L: prevL, u: prev_u } = segmentUnit(prevP1, prevP2);
+        
+        const remainingDistance = s_on_segment; // マイナスの値
+        s_on_segment = prevL + remainingDistance; // 前のセグメントの終端から計算
+        
+        const newPos = add(prevP1, scale(prev_u, s_on_segment));
+        coin.x = newPos.x;
+        coin.y = newPos.y;
+        
+        const prevSpeed = Math.abs(v_tangent);
+        coin.vx = prev_u.x * prevSpeed * onLineDirection;
+        coin.vy = prev_u.y * prevSpeed * onLineDirection;
+      } else { // 現在の線分の始端に達して逆走した場合
+        coinOnLine = false; // 投擲運動に切り替え
+        
+        // 線の終端での速度を設定して自然に切り替え
+        const finalSpeed = Math.abs(v_tangent);
+        coin.vx = current_u.x * finalSpeed * onLineDirection;
+        coin.vy = current_u.y * finalSpeed * onLineDirection;
+      }
+    } else { // 現在のセグメント内で移動
+      const newPos = add(p1, scale(current_u, s_on_segment));
+      coin.x = newPos.x;
+      coin.y = newPos.y;
+      
+      const finalSpeed = Math.abs(v_tangent);
+      coin.vx = current_u.x * finalSpeed * onLineDirection;
+      coin.vy = current_u.y * finalSpeed * onLineDirection;
+    }
+  }
+
+  const speed = Math.hypot(coin.vx, coin.vy);
+  const direction = Math.sign(coin.vx) || 1;
+  coin.spinAngle += speed * SPIN_FACTOR * FIXED_DT * direction;
+
+  const coinDrawX = coin.x;
+  const coinDrawY = coin.y + (-1) * coin.radius;
+  const goalDrawX = END_X;
+  const goalDrawY = END_Y - COIN_RADIUS;
+  const distBetweenCoinAndGoal = len(sub({x: coinDrawX, y: coinDrawY}, {x: goalDrawX, y: goalDrawY}));
+  
+  const adjustedCombinedRadii = COIN_RADIUS + GOAL_RADIUS - (COIN_RADIUS * 0.5);
+
+  if (gameStarted && distBetweenCoinAndGoal < adjustedCombinedRadii) {
+    elapsedTime = Date.now() - startTime;
+    if (elapsedTime < bestTime) {
+      bestTime = elapsedTime;
+    }
+    gameStarted = false;
+    startStopButton.textContent = 'スタート';
+  }
+
+  if(coin.y > canvas.height + coin.radius * 3 || coin.x < -coin.radius * 3 || coin.x > canvas.width + coin.radius * 3){
+    gameStarted = false;
+    startStopButton.textContent = 'スタート';
+  }
+}
+
+function drawCoinWithStar(c){
+  ctx.save();
+  
+  let drawX = c.x;
+  let drawY = c.y;
+
+  // コインが線上にいる場合、線に沿って描画位置を微調整（見た目の修正）
+  if(coinOnLine && onLineLineIndex !== -1 && onLineIndex >= 0 && smoothedLines[onLineLineIndex] && smoothedLines[onLineLineIndex].length > onLineIndex + 1){
+    const currentLine = smoothedLines[onLineLineIndex];
+    const p1 = currentLine[onLineIndex];
+    const p2 = currentLine[onLineIndex + 1];
+    const cp = closestPointOnSegment({x: c.x, y: c.y}, p1, p2);
+    drawX = cp.pt.x;
+    drawY = cp.pt.y;
+  }
+
+  let normalVector = {x: 0, y: -1}; // コインの描画方向の基準（上向き）
+  
+  const finalDrawX = drawX;
+  const finalDrawY = drawY + normalVector.y * c.radius; // 円の中心Y座標から半径分上にオフセット
+
+  ctx.translate(finalDrawX, finalDrawY);
+  ctx.rotate(c.spinAngle);
+  ctx.beginPath();
+  ctx.arc(0, 0, c.radius, 0, Math.PI * 2);
+  ctx.fillStyle='#f1c40f'; ctx.fill();
+  ctx.lineWidth = 2; ctx.strokeStyle = '#c0392b'; ctx.stroke();
+
+  ctx.fillStyle='#fff'; ctx.beginPath();
+  const spikes = 5, outerR = c.radius * 0.62, innerR = c.radius * 0.28;
+  for(let i = 0; i < spikes * 2; i++){
+    const r = (i % 2 === 0) ? outerR : innerR;
+    const ang = i * Math.PI / spikes;
+    const x = Math.cos(ang) * r; const y = Math.sin(ang) * r;
+    if(i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.closePath(); ctx.fill();
+  ctx.restore();
+}
+
+function draw(){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  
+  ctx.fillStyle='#2ecc71';
+  ctx.beginPath();
+  ctx.arc(START_X, START_Y - COIN_RADIUS, 18, 0, Math.PI*2);
+  ctx.fill();
+  
+  ctx.fillStyle='#e74c3c';
+  ctx.beginPath();
+  ctx.arc(END_X, END_Y - COIN_RADIUS, 18, 0, Math.PI*2);
+  ctx.fill();
+
+  ctx.strokeStyle='#8fb8ff'; ctx.lineWidth=5;
+  // 手書きツールの描画プレビュー
+  if(activeTool === 'pen' && isDrawing && drawingPoints.length > 0){
+    ctx.beginPath();
+    ctx.moveTo(drawingPoints[0].x,drawingPoints[0].y);
+    for(let i=1;i<drawingPoints.length;i++) ctx.lineTo(drawingPoints[i].x,drawingPoints[i].y);
+    ctx.stroke();
+  } 
+
+  ctx.strokeStyle='#3498db'; ctx.lineWidth=5;
+  // 複数の滑らかな線を描画
+  for (const line of smoothedLines) {
+    if (line.length > 0) {
+      ctx.beginPath();
+      ctx.moveTo(line[0].x, line[0].y);
+      for(let i=1; i<line.length; i++) ctx.lineTo(line[i].x, line[i].y);
+      ctx.stroke();
+    }
+  }
+  
+  if(coin) drawCoinWithStar(coin);
+  
+  ctx.fillStyle = '#222';
+  ctx.font = '24px sans-serif';
+  ctx.textAlign = 'center';
+  const textY = canvas.height - 20;
+
+  if (gameStarted) {
+    const currentTime = Date.now() - startTime;
+    ctx.fillText(`時間: ${(currentTime / 1000).toFixed(2)}秒`, canvas.width / 2, textY);
+  } else {
+    ctx.fillText(`時間: ${(elapsedTime / 1000).toFixed(2)}秒`, canvas.width / 2, textY);
+  }
+  
+  if (bestTime !== Infinity) {
+    ctx.fillText(`最速: ${(bestTime / 1000).toFixed(2)}秒`, canvas.width / 2, textY - 30);
+  }
+}
+
+function loop(){
+  let now = performance.now();
+  let delta = now - lastUpdate;
+  
+  while(delta >= FIXED_DT * 1000){
+    update();
+    delta -= FIXED_DT * 1000;
+    lastUpdate += FIXED_DT * 1000;
+  }
+  
+  draw();
+  requestAnimationFrame(loop);
+}
+
+function getPointerPos(e){
+  const rect=canvas.getBoundingClientRect();
+  if(e.touches && e.touches.length>0) return { x:e.touches[0].clientX-rect.left, y:e.touches[0].clientY-rect.top };
+  else return { x:e.clientX-rect.left, y:e.clientY-rect.top };
+}
+
+function eraseLine(pos){
+  const eraseRadius = 10;
+  let lineToRemove = -1;
+  for(let lineIdx = 0; lineIdx < smoothedLines.length; lineIdx++){
+    const currentLine = smoothedLines[lineIdx];
+    if (currentLine.length < 2) continue;
+
+    for(let segIdx = 0; segIdx < currentLine.length - 1; segIdx++){
+      const p1 = currentLine[segIdx];
+      const p2 = currentLine[segIdx+1];
+      const cp = closestPointOnSegment(pos, p1, p2);
+      if(len(sub(cp.pt, pos)) <= eraseRadius){
+        lineToRemove = lineIdx;
+        break; // この線が見つかったら、この線を削除対象にする
+      }
+    }
+    if (lineToRemove !== -1) break;
+  }
+  
+  if (lineToRemove !== -1) {
+    smoothedLines.splice(lineToRemove, 1); // 該当する線を削除
+    // もし削除した線にコインが乗っていたら、coinOnLineをfalseにする
+    if (onLineLineIndex === lineToRemove) {
+      coinOnLine = false;
+      onLineLineIndex = -1;
+      onLineIndex = -1;
+    }
+    // 削除によってインデックスがずれる可能性があるので調整
+    if (onLineLineIndex > lineToRemove) {
+      onLineLineIndex--;
+    }
+  }
+}
+
+
+function disableControls(state) {
+  controls.forEach(btn => btn.disabled = state);
+}
+
+canvas.addEventListener('pointerdown',(e)=>{
+  if(gameStarted) return;
+  const pos = getPointerPos(e);
+  
+  if (activeTool === 'eraser') {
+    eraseLine(pos);
+    return;
+  }
+
+  canvas.setPointerCapture(e.pointerId);
+  disableControls(true);
+
+  if (activeTool === 'pen') {
+    isDrawing = true;
+    drawingPoints = [pos];
+  }
+});
+
+canvas.addEventListener('pointermove', (e) => {
+  if (activeTool === 'pen' && isDrawing) {
+    const pos = getPointerPos(e);
+    drawingPoints.push(pos);
+  }
+});
+
+canvas.addEventListener('pointerup', () => {
+  if (activeTool === 'pen' && isDrawing) {
+    isDrawing = false;
+    const newSmoothedLine = smoothLine(drawingPoints);
+    if (newSmoothedLine.length > 1) { // 少なくとも2点以上ないと線とみなさない
+        smoothedLines.push(newSmoothedLine);
+    }
+    drawingPoints = [];
+    disableControls(false);
+  }
+});
+
+canvas.addEventListener('dblclick', () => {
+    if (activeTool === 'pen') {
+        isDrawing = false;
+        const newSmoothedLine = smoothLine(drawingPoints);
+        if (newSmoothedLine.length > 1) {
+            smoothedLines.push(newSmoothedLine);
+        }
+        drawingPoints = [];
+        disableControls(false);
+    }
+});
+
+canvas.addEventListener('pointerleave', () => {
+  if (activeTool === 'pen' && isDrawing) {
+    isDrawing = false;
+    const newSmoothedLine = smoothLine(drawingPoints);
+    if (newSmoothedLine.length > 1) {
+        smoothedLines.push(newSmoothedLine);
+    }
+    drawingPoints = [];
+    disableControls(false);
+  }
+});
+
+// サイクロイド曲線生成関数
+function createCycloid(){
+    const start = startPoint;
+    const end = endPoint;
+    const dx = end.x - start.x;
+    const dy = end.y - start.y;
+    
+    // オフセット適用後の始点と終点
+    const offsetStart = {x: start.x + START_OFFSET_X, y: start.y};
+    const offsetEnd = {x: end.x + END_OFFSET_X, y: end.y};
+    const offsetDx = offsetEnd.x - offsetStart.x;
+    const offsetDy = offsetEnd.y - offsetStart.y;
+
+    let thetaMax, R;
+    const newPoints = [];
+    const numPoints = 31;
+
+    if (offsetDy === 0) {
+      // 水平な場合
+      thetaMax = 2 * Math.PI;
+      R = offsetDx / (2 * Math.PI);
+    } else {
+      // 一般的なサイクロイド
+      function findTheta(dx, dy) {
+          const f = theta => (theta - Math.sin(theta)) / (1 - Math.cos(theta)) - (dx / dy);
+          let low = 0.001, high = 2 * Math.PI;
+          if (dy < 0) {
+              low = -2 * Math.PI;
+              high = -0.001;
+          }
+          for(let i = 0; i < 50; i++) {
+              const mid = (low + high) / 2;
+              if (f(mid) < 0) low = mid;
+              else high = mid;
+          }
+          return high;
+      }
+      thetaMax = findTheta(offsetDx, offsetDy);
+      R = offsetDy / (1 - Math.cos(thetaMax));
+    }
+
+    for(let i = 0; i < numPoints; i++) {
+      const theta = (i / (numPoints - 1)) * thetaMax;
+      const x = offsetStart.x + R * (theta - Math.sin(theta));
+      const y = offsetStart.y + R * (1 - Math.cos(theta));
+      newPoints.push({x, y});
+    }
+
+    if(newPoints.length > 1) {
+        smoothedLines.push(newPoints);
+    }
+}
+
+
+startStopButton.addEventListener('click',()=>{
+  if (gameStarted) {
+    gameStarted = false;
+    startStopButton.textContent = 'スタート';
+  } else {
+    if(!coin) coin=createCoin(START_X, START_Y);
+    coin.x=START_X; coin.y=START_Y; coin.vx=0; coin.vy=0; coin.spinAngle=0;
+    gameStarted=true; 
+    coinOnLine=false; 
+    onLineLineIndex = -1; // リセット
+    onLineIndex=-1; 
+    s_on_segment = 0;
+    onLineDirection = 1;
+    startTime = Date.now();
+    lastUpdate = performance.now();
+    startStopButton.textContent = 'ストップ';
+  }
+});
+
+resetButton.addEventListener('click',()=>{
+  coin=createCoin(START_X, START_Y);
+  gameStarted=false; 
+  coinOnLine=false; 
+  onLineLineIndex = -1; // リセット
+  onLineIndex=-1; 
+  s_on_segment = 0;
+  onLineDirection = 1;
+  elapsedTime = 0;
+  startStopButton.textContent = 'スタート';
+});
+
+clearButton.addEventListener('click',()=>{
+  smoothedLines=[]; 
+  drawingPoints=[];
+});
+
+toolButtons.forEach(button => {
+  button.addEventListener('click', () => {
+    toolButtons.forEach(btn => btn.classList.remove('active-tool'));
+    button.classList.add('active-tool');
+    activeTool = button.dataset.tool;
+    isDrawing = false;
+    drawingPoints = [];
+  });
+});
+
+cycloidButton.addEventListener('click', () => {
+  createCycloid();
+  toolButtons.forEach(btn => btn.classList.remove('active-tool'));
+  document.getElementById('toolPen').classList.add('active-tool');
+  activeTool = 'pen';
+});
+
+coin=createCoin(START_X, START_Y);
+loop();
+</script>
+</body>
+</html>

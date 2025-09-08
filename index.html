@@ -131,6 +131,7 @@ function closestPointOnSegment(p,p1,p2){
   return { pt:{x:p1.x+d.x*tt, y:p1.y+d.y*tt}, t:tt };
 }
 
+
 function tryBindToLineIfContact(coin){
   // 各線に対して吸着判定を行う
   for(let lineIdx = 0; lineIdx < smoothedLines.length; lineIdx++){
@@ -142,25 +143,26 @@ function tryBindToLineIfContact(coin){
       const cp = closestPointOnSegment({x:coin.x, y:coin.y}, p1, p2);
       const closest = cp.pt;
       const dist = len(sub(closest, {x:coin.x, y:coin.y}));
-      
+
       if(dist <= coin.radius){
         const v = {x:coin.vx, y:coin.vy};
         const u = normalize(sub(p2, p1));
         const normal = normalize(sub({x:coin.x, y:coin.y}, closest));
         const v_normal = dot(v, normal);
-        
-        if(v_normal < 0){ // 法線方向にめり込んでいる場合のみ吸着
+
+        // 法線方向にめり込んでいる、かつコインが下向き（y方向速度が正）に進んでいる場合のみ吸着
+        if(v_normal < 0 && coin.vy > 0){
           coin.x = closest.x;
           coin.y = closest.y;
-          
+
           coinOnLine = true;
           onLineLineIndex = lineIdx; // 何番目の線か
           onLineIndex = segIdx;      // その線の何番目のセグメントか
           s_on_segment = len(sub(closest, p1));
-          
+
           const tangentialSpeed = dot(v, u);
           onLineDirection = Math.sign(tangentialSpeed) || 1;
-          
+
           return true;
         }
       }

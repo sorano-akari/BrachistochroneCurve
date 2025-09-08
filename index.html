@@ -62,6 +62,7 @@ const cycloidButton = document.getElementById('toolCycloid');
 const GRAVITY = 980;
 const FIXED_DT = 1/120;
 const SPIN_FACTOR = 0.05;
+const FIXED_SEGMENT_LENGTH = 10;
 
 function sub(a,b){return {x:a.x-b.x, y:a.y-b.y};}
 function add(a,b){return {x:a.x+b.x, y:a.y+b.y};}
@@ -73,8 +74,8 @@ function normalize(a){ const L=len(a)||1; return {x:a.x/L, y:a.y/L};}
 let coin = null;
 let gameStarted = false;
 let coinOnLine = false;
-let onLineLineIndex = -1; // 何番目の線に吸着しているか
-let onLineIndex = -1;     // その線の何番目のセグメントに吸着しているか
+let onLineLineIndex = -1;
+let onLineIndex = -1;
 let s_on_segment = 0;
 let onLineDirection = 1;
 let startTime = 0;
@@ -83,7 +84,7 @@ let bestTime = Infinity;
 let lastUpdate = performance.now();
 
 let drawingPoints = [];
-let smoothedLines = []; // smoothedLines は [[{x,y},{x,y},...], [{x,y},{x,y},...]] のような構造になる
+let smoothedLines = [];
 let activeTool = 'pen';
 let isDrawing = false;
 let currentMousePos = null;
@@ -105,15 +106,26 @@ function createCoin(x,y){
 }
 
 function smoothLine(points){
-  if(points.length<3) return points.slice();
-  const out=[points[0]];
-  for(let i=1;i<points.length-1;i++){
-    const avgX=(points[i-1].x+points[i].x+points[i+1].x)/3;
-    const avgY=(points[i-1].y+points[i].y+points[i+1].y)/3;
-    out.push({x:avgX,y:avgY});
+  if(points.length < 2) return points;
+  
+  const result = [points[0]];
+  let currentLength = 0;
+  
+  for(let i = 1; i < points.length; i++){
+    const p1 = points[i-1];
+    const p2 = points[i];
+    const segmentLen = len(sub(p2, p1));
+    currentLength += segmentLen;
+    
+    while(currentLength >= FIXED_SEGMENT_LENGTH){
+      const t = (currentLength - FIXED_SEGMENT_LENGTH) / segmentLen;
+      const newPoint = add(p2, scale(sub(p1, p2), t));
+      result.push(newPoint);
+      currentLength -= FIXED_SEGMENT_LENGTH;
+    }
   }
-  out.push(points[points.length-1]);
-  return out;
+  result.push(points[points.length-1]);
+  return result;
 }
 
 function segmentUnit(p1,p2){
@@ -132,10 +144,34 @@ function closestPointOnSegment(p,p1,p2){
 }
 
 function tryBindToLineIfContact(coin){
-  // 各線に対して吸着判定を行う
+  // まず、吸着している線分がある場合はそれを優先的に確認する
+  if(coinOnLine && onLineLineIndex !== -1) {
+    const currentLine = smoothedLines[onLineLineIndex];
+    if (onLineIndex < currentLine.length - 1) {
+      const p1 = currentLine[onLineIndex];
+      const p2 = currentLine[onLineIndex + 1];
+      const { L } = segmentUnit(p1, p2);
+      
+      const cp = closestPointOnSegment({x:coin.x, y:coin.y}, p1, p2);
+      const closest = cp.pt;
+      const dist = len(sub(closest, {x:coin.x, y:coin.y}));
+      
+      // 吸着中の線分から離れすぎた場合、線から離れる
+      if(dist > coin.radius + 5) { // 許容範囲を少し広げる
+        coinOnLine = false;
+        return false;
+      }
+    } else {
+        // 現在の線分の終端に達したため、吸着を解除
+        coinOnLine = false;
+        return false;
+    }
+  }
+
+  // すべての線分に対して衝突判定を行い、吸着可能かチェック
   for(let lineIdx = 0; lineIdx < smoothedLines.length; lineIdx++){
     const currentLine = smoothedLines[lineIdx];
-    if (currentLine.length < 2) continue; // 線分が短すぎる場合はスキップ
+    if (currentLine.length < 2) continue;
 
     for(let segIdx = 0; segIdx < currentLine.length - 1; segIdx++){
       const p1 = currentLine[segIdx], p2 = currentLine[segIdx+1];
@@ -146,42 +182,26 @@ function tryBindToLineIfContact(coin){
       if(dist <= coin.radius){
         const v = {x:coin.vx, y:coin.vy};
         const u = normalize(sub(p2, p1));
-        const normal = {x: u.y, y: -u.x}; // 線分に垂直な法線ベクトル（右側を向く）
+        const normal = {x: u.y, y: -u.x};
         
         const v_normal = dot(v, normal);
         
-        // コインが線の「上側」から衝突した場合
+        // 線の上側から衝突した場合
         if(v_normal < 0){
-          coin.x = closest.x;
-          coin.y = closest.y;
+          const correctionVector = scale(normalize(sub({x:coin.x, y:coin.y}, closest)), coin.radius - dist);
+          coin.x += correctionVector.x;
+          coin.y += correctionVector.y;
+
           coinOnLine = true;
           onLineLineIndex = lineIdx;
           onLineIndex = segIdx;
           s_on_segment = len(sub(closest, p1));
+          
           const tangentialSpeed = dot(v, u);
           onLineDirection = Math.sign(tangentialSpeed) || 1;
+          
           return true;
         } 
-        // コインが線の「下側」から衝突した場合（反射）
-        else if (v_normal > 0) {
-          // めり込み量を考慮して位置を修正
-          const overlap = coin.radius - dist;
-          const correction = scale(normal, overlap);
-          coin.x += correction.x;
-          coin.y += correction.y;
-
-          // 反射計算
-          const v_tangent_scalar = dot(v, u);
-          const v_normal_scalar = dot(v, normal);
-
-          const v_tangent = scale(u, v_tangent_scalar);
-          const v_normal_reflected = scale(normal, -v_normal_scalar);
-
-          coin.vx = v_tangent.x + v_normal_reflected.x;
-          coin.vy = v_tangent.y + v_normal_reflected.y;
-
-          return false; // 跳ね返ったので吸着はしない
-        }
       }
     }
   }
@@ -191,13 +211,14 @@ function tryBindToLineIfContact(coin){
 function update(){
   if(!gameStarted) return;
   
-  if(!coinOnLine){
+  // 常に衝突判定を試みることで、線からの離脱や次の線への移行をスムーズにする
+  const boundToLine = tryBindToLineIfContact(coin);
+
+  if(!boundToLine){
     coin.vy += GRAVITY * FIXED_DT;
     coin.x += coin.vx * FIXED_DT;
     coin.y += coin.vy * FIXED_DT;
-    tryBindToLineIfContact(coin);
   } else {
-    // 吸着している線がなくなった場合、投擲運動に切り替え
     if (onLineLineIndex === -1 || smoothedLines[onLineLineIndex] === undefined || smoothedLines[onLineLineIndex].length < 2) {
       coinOnLine = false;
       return;
@@ -207,7 +228,6 @@ function update(){
     const p1 = currentLine[onLineIndex];
     const p2 = currentLine[onLineIndex + 1];
     
-    // p2が存在しない（線分の終端）場合も投擲運動に切り替え
     if (!p2) {
         coinOnLine = false;
         return;
@@ -218,22 +238,26 @@ function update(){
     const deltaY = coin.y - startPoint.y;
     const currentSpeedSq = 2 * GRAVITY * deltaY;
     
-    let v_tangent;
+    let v_tangent_scalar;
     
-    // 速度がゼロ以下になった場合、重力による加速を適用
     if (currentSpeedSq <= 0) {
         const g_tangential = dot({x: 0, y: GRAVITY}, current_u);
-        v_tangent = g_tangential * FIXED_DT;
+        v_tangent_scalar = g_tangential * FIXED_DT;
         onLineDirection = Math.sign(g_tangential) || 1;
     } else {
         const currentSpeed = Math.sqrt(currentSpeedSq);
-        v_tangent = currentSpeed * onLineDirection;
+        v_tangent_scalar = currentSpeed * onLineDirection;
     }
-
-    s_on_segment += v_tangent * FIXED_DT;
     
-    if(s_on_segment > L){ // 現在のセグメントの終端を超えた
-      if(onLineIndex < currentLine.length - 2){ // 同じ線の次のセグメントがある場合
+    // 物理シミュレーションをより正確にするために、現在の速度ベクトルを更新
+    coin.vx = current_u.x * v_tangent_scalar;
+    coin.vy = current_u.y * v_tangent_scalar;
+
+
+    s_on_segment += v_tangent_scalar * FIXED_DT;
+    
+    if(s_on_segment > L){
+      if(onLineIndex < currentLine.length - 2){
         const remainingDistance = s_on_segment - L;
         onLineIndex++;
         s_on_segment = remainingDistance;
@@ -246,48 +270,46 @@ function update(){
         coin.x = newPos.x;
         coin.y = newPos.y;
         
-        const nextSpeed = Math.abs(v_tangent);
+        const nextSpeed = Math.abs(v_tangent_scalar);
         coin.vx = next_u.x * nextSpeed * onLineDirection;
         coin.vy = next_u.y * nextSpeed * onLineDirection;
-      } else { // 現在の線分の終端に達した場合
-        coinOnLine = false; // 投擲運動に切り替え
-        
-        // 線の終端での速度を設定して自然に切り替え
-        const finalSpeed = Math.abs(v_tangent);
+      } else {
+        // 線分の終端に達したら、吸着を解除し、終端での速度を維持する
+        coinOnLine = false;
+        const finalSpeed = Math.abs(v_tangent_scalar);
         coin.vx = current_u.x * finalSpeed * onLineDirection;
         coin.vy = current_u.y * finalSpeed * onLineDirection;
       }
-    } else if (s_on_segment < 0){ // 現在のセグメントの始端を超えて逆走した場合
-      if (onLineIndex > 0) { // 同じ線の前のセグメントがある場合
+    } else if (s_on_segment < 0){
+      if (onLineIndex > 0) {
         onLineIndex--;
         const prevP1 = currentLine[onLineIndex];
         const prevP2 = currentLine[onLineIndex+1];
         const { L: prevL, u: prev_u } = segmentUnit(prevP1, prevP2);
         
-        const remainingDistance = s_on_segment; // マイナスの値
-        s_on_segment = prevL + remainingDistance; // 前のセグメントの終端から計算
+        const remainingDistance = s_on_segment;
+        s_on_segment = prevL + remainingDistance;
         
         const newPos = add(prevP1, scale(prev_u, s_on_segment));
         coin.x = newPos.x;
         coin.y = newPos.y;
         
-        const prevSpeed = Math.abs(v_tangent);
+        const prevSpeed = Math.abs(v_tangent_scalar);
         coin.vx = prev_u.x * prevSpeed * onLineDirection;
         coin.vy = prev_u.y * prevSpeed * onLineDirection;
-      } else { // 現在の線分の始端に達して逆走した場合
-        coinOnLine = false; // 投擲運動に切り替え
-        
-        // 線の終端での速度を設定して自然に切り替え
-        const finalSpeed = Math.abs(v_tangent);
+      } else {
+        // 線分の始端に達したら、吸着を解除し、始端での速度を維持する
+        coinOnLine = false;
+        const finalSpeed = Math.abs(v_tangent_scalar);
         coin.vx = current_u.x * finalSpeed * onLineDirection;
         coin.vy = current_u.y * finalSpeed * onLineDirection;
       }
-    } else { // 現在のセグメント内で移動
+    } else {
       const newPos = add(p1, scale(current_u, s_on_segment));
       coin.x = newPos.x;
       coin.y = newPos.y;
       
-      const finalSpeed = Math.abs(v_tangent);
+      const finalSpeed = Math.abs(v_tangent_scalar);
       coin.vx = current_u.x * finalSpeed * onLineDirection;
       coin.vy = current_u.y * finalSpeed * onLineDirection;
     }
@@ -326,7 +348,6 @@ function drawCoinWithStar(c){
   let drawX = c.x;
   let drawY = c.y;
 
-  // コインが線上にいる場合、線に沿って描画位置を微調整（見た目の修正）
   if(coinOnLine && onLineLineIndex !== -1 && onLineIndex >= 0 && smoothedLines[onLineLineIndex] && smoothedLines[onLineLineIndex].length > onLineIndex + 1){
     const currentLine = smoothedLines[onLineLineIndex];
     const p1 = currentLine[onLineIndex];
@@ -336,10 +357,10 @@ function drawCoinWithStar(c){
     drawY = cp.pt.y;
   }
 
-  let normalVector = {x: 0, y: -1}; // コインの描画方向の基準（上向き）
+  let normalVector = {x: 0, y: -1};
   
   const finalDrawX = drawX;
-  const finalDrawY = drawY + normalVector.y * c.radius; // 円の中心Y座標から半径分上にオフセット
+  const finalDrawY = drawY + normalVector.y * c.radius;
 
   ctx.translate(finalDrawX, finalDrawY);
   ctx.rotate(c.spinAngle);
@@ -374,7 +395,6 @@ function draw(){
   ctx.fill();
 
   ctx.strokeStyle='#8fb8ff'; ctx.lineWidth=5;
-  // 手書きツールの描画プレビュー
   if(activeTool === 'pen' && isDrawing && drawingPoints.length > 0){
     ctx.beginPath();
     ctx.moveTo(drawingPoints[0].x,drawingPoints[0].y);
@@ -383,7 +403,6 @@ function draw(){
   } 
 
   ctx.strokeStyle='#3498db'; ctx.lineWidth=5;
-  // 複数の滑らかな線を描画
   for (const line of smoothedLines) {
     if (line.length > 0) {
       ctx.beginPath();
@@ -445,21 +464,19 @@ function eraseLine(pos){
       const cp = closestPointOnSegment(pos, p1, p2);
       if(len(sub(cp.pt, pos)) <= eraseRadius){
         lineToRemove = lineIdx;
-        break; // この線が見つかったら、この線を削除対象にする
+        break;
       }
     }
     if (lineToRemove !== -1) break;
   }
   
-  if (lineToRemove !== -1) {
-    smoothedLines.splice(lineToRemove, 1); // 該当する線を削除
-    // もし削除した線にコインが乗っていたら、coinOnLineをfalseにする
+  if (lineToToRemove !== -1) {
+    smoothedLines.splice(lineToRemove, 1);
     if (onLineLineIndex === lineToRemove) {
       coinOnLine = false;
       onLineLineIndex = -1;
       onLineIndex = -1;
     }
-    // 削除によってインデックスがずれる可能性があるので調整
     if (onLineLineIndex > lineToRemove) {
       onLineLineIndex--;
     }
@@ -500,7 +517,7 @@ canvas.addEventListener('pointerup', () => {
   if (activeTool === 'pen' && isDrawing) {
     isDrawing = false;
     const newSmoothedLine = smoothLine(drawingPoints);
-    if (newSmoothedLine.length > 1) { // 少なくとも2点以上ないと線とみなさない
+    if (newSmoothedLine.length > 1) {
         smoothedLines.push(newSmoothedLine);
     }
     drawingPoints = [];
@@ -532,14 +549,12 @@ canvas.addEventListener('pointerleave', () => {
   }
 });
 
-// サイクロイド曲線生成関数
 function createCycloid(){
     const start = startPoint;
     const end = endPoint;
     const dx = end.x - start.x;
     const dy = end.y - start.y;
     
-    // オフセット適用後の始点と終点
     const offsetStart = {x: start.x + START_OFFSET_X, y: start.y};
     const offsetEnd = {x: end.x + END_OFFSET_X, y: end.y};
     const offsetDx = offsetEnd.x - offsetStart.x;
@@ -550,11 +565,9 @@ function createCycloid(){
     const numPoints = 31;
 
     if (offsetDy === 0) {
-      // 水平な場合
       thetaMax = 2 * Math.PI;
       R = offsetDx / (2 * Math.PI);
     } else {
-      // 一般的なサイクロイド
       function findTheta(dx, dy) {
           const f = theta => (theta - Math.sin(theta)) / (1 - Math.cos(theta)) - (dx / dy);
           let low = 0.001, high = 2 * Math.PI;
@@ -595,7 +608,7 @@ startStopButton.addEventListener('click',()=>{
     coin.x=START_X; coin.y=START_Y; coin.vx=0; coin.vy=0; coin.spinAngle=0;
     gameStarted=true; 
     coinOnLine=false; 
-    onLineLineIndex = -1; // リセット
+    onLineLineIndex = -1;
     onLineIndex=-1; 
     s_on_segment = 0;
     onLineDirection = 1;
@@ -609,7 +622,7 @@ resetButton.addEventListener('click',()=>{
   coin=createCoin(START_X, START_Y);
   gameStarted=false; 
   coinOnLine=false; 
-  onLineLineIndex = -1; // リセット
+  onLineLineIndex = -1;
   onLineIndex=-1; 
   s_on_segment = 0;
   onLineDirection = 1;
